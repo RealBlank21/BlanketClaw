@@ -60,7 +60,29 @@ async function triggerLLM() {
             printThink(thinkingToken);
         } 
         else if (contentToken) {
-            if (inThinking) {
+            let cleanToken = contentToken;
+            
+            if (cleanToken.includes('<think>')) {
+                if (!inThinking) {
+                    inThinking = true;
+                    if (state.thinkMode === 'show') {
+                        process.stdout.write(pc.dim('\n') + pc.gray('│  ') + pc.dim('┌─ [Thinking]\n') + pc.gray('│  ') + pc.dim('│  '));
+                    }
+                }
+                cleanToken = cleanToken.replace(/<think>/g, '');
+            }
+
+            if (cleanToken.includes('</think>')) {
+                if (inThinking) {
+                    inThinking = false;
+                    if (state.thinkMode === 'show') {
+                        process.stdout.write(pc.dim('\n') + pc.gray('│  ') + pc.dim('└─ [Done]\n') + pc.gray('│  '));
+                    }
+                }
+                cleanToken = cleanToken.replace(/<\/think>/g, '');
+            }
+
+            if (inThinking && !contentToken.includes('<think>') && contentToken.trim() !== '') {
                 inThinking = false;
                 if (state.thinkMode === 'show') {
                     process.stdout.write(pc.dim('\n') + pc.gray('│  ') + pc.dim('└─ [Done]\n') + pc.gray('│  '));
@@ -69,9 +91,10 @@ async function triggerLLM() {
             
             fullResponse += contentToken;
             
-            const cleanToken = contentToken.replace(/<think>|<\/think>/g, '');
-            if (cleanToken) {
-                printNormal(cleanToken);
+            if (cleanToken && inThinking) {
+                 printThink(cleanToken);
+            } else if (cleanToken) {
+                 printNormal(cleanToken);
             }
         }
     };
@@ -80,13 +103,11 @@ async function triggerLLM() {
         if (state.provider === 'ollama') {
             toolCalls = await streamOllama(apiMessages, onChunkCallback);
         } else if (state.provider === 'openrouter') {
-            
             if (!activeConfig.providers.openrouter.apiKey || activeConfig.providers.openrouter.apiKey === "YOUR_OPENROUTER_KEY") {
                 process.stdout.write(pc.red(`\n│  Error: Please set your OpenRouter API Key in ~/.blanketclaw/config.json`));
                 process.stdout.write('\n' + pc.gray('│\n'));
                 return;
             }
-
             toolCalls = await streamOpenRouter(apiMessages, onChunkCallback);
         } else {
             process.stdout.write(pc.red(`\n│  Error: Unknown provider '${state.provider}'`));
@@ -98,26 +119,46 @@ async function triggerLLM() {
         return;
     }
 
-    if (fullResponse.trim() !== "" || fullThinking.length > 0) {
+    if (inThinking) {
+        inThinking = false;
+        if (state.thinkMode === 'show') {
+            process.stdout.write(pc.dim('\n') + pc.gray('│  ') + pc.dim('└─ [Done]\n') + pc.gray('│  '));
+        }
+    }
+
+    if (toolCalls && toolCalls.length > 0) {
+        for (const tc of toolCalls) {
+            if (!tc.id) {
+                tc.id = `call_${Math.random().toString(36).substring(2, 11)}`;
+            }
+        }
+    }
+
+    if (fullResponse.trim() !== "" || fullThinking.length > 0 || (toolCalls && toolCalls.length > 0)) {
         process.stdout.write('\n' + pc.gray('│\n'));
         
         if (fullThinking.length > 0) {
             fullResponse = `<think>\n${fullThinking}\n</think>\n${fullResponse}`;
         }
         
-        state.history.push({ role: 'assistant', content: fullResponse });
+        const assistantMessage = { role: 'assistant', content: fullResponse };
+        
+        if (toolCalls && toolCalls.length > 0) {
+            assistantMessage.tool_calls = toolCalls;
+        }
+        
+        state.history.push(assistantMessage);
     } else {
         process.stdout.write('\n');
     }
 
     if (toolCalls && toolCalls.length > 0) {
-        state.history.push({ role: 'assistant', tool_calls: toolCalls, content: "" });
-        
         for (const tc of toolCalls) {
             const toolResult = await executeTool(tc);
+            
+            // --- FIX: Strictly adhere to 'role', 'content', and 'tool_call_id' ---
             state.history.push({ 
                 role: 'tool', 
-                name: tc.function.name, 
                 content: toolResult,
                 tool_call_id: tc.id 
             });
