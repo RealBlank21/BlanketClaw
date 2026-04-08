@@ -2,7 +2,7 @@
 
 **An autonomous, context-aware CLI AI Assistant built for developers.**
 
-BlanketClaw is a Node.js terminal agent designed to sit right inside your codebase. It doesn't just chat; it reads your local files, tracks token usage, utilizes reasoning models (like DeepSeek-R1), and can autonomously execute shell commands to build, debug, and navigate your projects.
+BlanketClaw is a Node.js terminal agent designed to sit right inside your codebase. It doesn't just chat; it reads your local files, tracks token usage, utilizes reasoning models, and can autonomously execute shell commands to build, debug, and navigate your projects.
 
 ### ✨ Key Features
 * **Universal Provider Support:** Seamlessly switch between local models via **Ollama** and cloud models via **OpenRouter**.
