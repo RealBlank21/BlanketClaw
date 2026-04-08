@@ -1,0 +1,23 @@
+# Node dependencies
+node_modules/
+
+# BlanketClaw local session logs (from your /log command)
+blanketclaw-log-*.json
+
+# Environment variables (just in case you ever add a local .env file later)
+.env
+.env.local
+
+# npm/yarn crash logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

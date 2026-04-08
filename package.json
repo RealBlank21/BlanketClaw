@@ -1,0 +1,18 @@
+{
+  "name": "blanketclaw",
+  "version": "1.0.0",
+  "description": "CLI AI Assistant",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "blanketclaw": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.7.0",
+    "fast-glob": "^3.3.2",
+    "picocolors": "^1.0.0"
+  }
+}
