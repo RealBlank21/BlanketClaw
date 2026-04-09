@@ -1,14 +1,16 @@
 #!/usr/bin/env node
+import fs from 'fs';
+import path from 'path';
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
 import readline from 'readline';
 import fg from 'fast-glob';
 
 import { state } from './lib/state.js';
-import { initializeGlobalDirectory, loadConfig, GLOBAL_DIR, activeConfig } from './lib/config.js';
+import { initializeGlobalDirectory, loadConfig, GLOBAL_DIR, CACHE_DIR, activeConfig } from './lib/config.js';
 import { buildSystemPrompt } from './lib/prompt.js';
 import { streamOllama, streamOpenRouter } from './lib/api.js';
-import { executeTool } from './lib/tools.js';
+import { executeTool, setupMcp } from './lib/tools.js';
 import { handleCommand } from './lib/commands.js';
 import { logDebug } from './lib/logger.js';
 
@@ -30,36 +32,29 @@ async function triggerLLM(retryCount = 0) {
     let inThinking = false;
     let hasNativeThinking = false;
 
-    let inCodeBlock = false; // Tracks markdown state across streaming chunks
+    let inCodeBlock = false; 
 
     function printNormal(text) {
-        // Split the incoming chunk by triple backticks to toggle the state
         const parts = text.split('```');
         
         for (let i = 0; i < parts.length; i++) {
-            // Flip the code block state every time we cross a ``` boundary
             if (i > 0) inCodeBlock = !inCodeBlock;
             
             const chunk = parts[i];
             
-            // Split by newline so we can maintain the left-hand border design
             const lines = chunk.split('\n');
             for (let j = 0; j < lines.length; j++) {
                 let lineText = lines[j];
                 
                 if (inCodeBlock) {
-                    // Inside a code block: Color everything cyan so it pops
                     lineText = pc.cyan(lineText);
                 } else {
-                    // Outside a code block: Attempt basic inline markdown parsing
-                    // (Note: Regex works best here if the token isn't heavily fragmented by the stream)
                     lineText = lineText.replace(/\*\*(.*?)\*\*/g, pc.bold(pc.white('$1')));
-                    lineText = lineText.replace(/`([^`]+)`/g, pc.yellow('$1')); // Inline code
+                    lineText = lineText.replace(/`([^`]+)`/g, pc.yellow('$1')); 
                 }
 
                 process.stdout.write(lineText);
                 
-                // Print the border prefix for the next line
                 if (j < lines.length - 1) {
                     process.stdout.write('\n' + pc.gray('│  '));
                 }
@@ -170,6 +165,20 @@ async function triggerLLM(retryCount = 0) {
         }
     }
 
+    let codeBlocks = [];
+    const codeBlockRegex = /```(\w*)\r?\n([\s\S]*?)```/g;
+    let match;
+    let blockIndex = 1;
+    while ((match = codeBlockRegex.exec(fullResponse)) !== null) {
+        let ext = match[1].trim() || "txt";
+        if (ext.length > 10) ext = "txt";
+        const code = match[2].trim();
+        const cachePath = path.join(CACHE_DIR, `cached_code_${blockIndex}.${ext}`);
+        fs.writeFileSync(cachePath, code, 'utf-8');
+        codeBlocks.push(cachePath.replace(/\\/g, '/'));
+        blockIndex++;
+    }
+
     if (fullResponse.trim() !== "" || (toolCalls && toolCalls.length > 0)) {
         process.stdout.write('\n' + pc.gray('│\n'));
         
@@ -184,23 +193,40 @@ async function triggerLLM(retryCount = 0) {
         if (cleanHistoryContent !== "" || (toolCalls && toolCalls.length > 0)) {
             state.history.push(assistantMessage);
         }
+
+        if (codeBlocks.length > 0 && (!toolCalls || toolCalls.length === 0)) {
+            if (retryCount === 0) {
+                process.stdout.write(pc.yellow(`│  [System: Code block(s) detected with no tool calls. Safely cached.]\n`));
+                process.stdout.write(pc.cyan(`│  [Auto-Prompt]: Asking AI if it wants to save the cached code...\n`));
+                process.stdout.write(pc.gray('│\n'));
+
+                state.history.push({
+                    role: 'user',
+                    content: `SYSTEM: You generated code block(s) but did not call any tools to save them. Are you sure the code isn't supposed to be saved?\n\nIf you intended to save it, I have automatically cached your code block(s) here:\n${codeBlocks.map(p => `- ${p}`).join('\n')}\n\nYou can now use the \`move_file\` tool to move the cached file(s) into their actual intended directory (e.g., source: "${codeBlocks[0]}", destination: "actual/path/to/file"). If it was just for explanation and no saving is needed, just say so.`
+                });
+
+                await triggerLLM(retryCount + 1);
+                return;
+            }
+        }
+
     } else {
         logDebug('warn', 'LLM returned empty response and no tools.');
-        process.stdout.write(pc.yellow(`\n│  [System: Ollama dropped the tool call due to invalid JSON syntax.]\n`));
+        process.stdout.write(pc.yellow(`\n│  [System: Model generated reasoning but failed to output a response or call a tool.]\n`));
         
         if (retryCount < 3) {
-            process.stdout.write(pc.cyan(`│  [Auto-Retry ${retryCount + 1}/3]: Forcing the AI to fix its formatting...\n`));
+            process.stdout.write(pc.cyan(`│  [Auto-Retry ${retryCount + 1}/3]: Prompting model to use native tools...\n`));
             process.stdout.write(pc.gray('│\n'));
             
             state.history.push({
                 role: 'user',
-                content: "SYSTEM WARNING: Your tool call was dropped due to invalid JSON. If writing a file, DO NOT pass code in the JSON arguments. Write the code in a standard markdown block in your text response, then call write_file with ONLY the path."
+                content: "SYSTEM WARNING: You generated a thought process but did not output any text or invoke any tools. You MUST invoke a native tool to complete the action."
             });
             
             await triggerLLM(retryCount + 1);
             return;
         } else {
-            process.stdout.write(pc.red(`│  [System]: AI failed to format JSON after 3 attempts. Aborting.\n`));
+            process.stdout.write(pc.red(`│  [System]: AI failed to execute correctly after 3 attempts. Aborting.\n`));
             process.stdout.write(pc.gray('│\n'));
         }
     }
@@ -317,6 +343,11 @@ async function run() {
 
     p.log.message(pc.magenta(`Active Model: ${state.provider}/${state.currentModel}`));
     process.stdout.write(pc.gray('│\n'));
+
+    const s = p.spinner();
+    s.start('Connecting to MCP Servers...');
+    await setupMcp();
+    s.stop('MCP Servers Connected.');
 
     await mainLoop();
 }

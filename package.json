@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@clack/prompts": "^0.7.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
     "fast-glob": "^3.3.2",
     "officeparser": "^6.0.7",
     "openai": "^4.28.0",
