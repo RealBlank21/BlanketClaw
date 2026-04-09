@@ -10,6 +10,7 @@ import { buildSystemPrompt } from './lib/prompt.js';
 import { streamOllama, streamOpenRouter } from './lib/api.js';
 import { executeTool } from './lib/tools.js';
 import { handleCommand } from './lib/commands.js';
+import { logDebug } from './lib/logger.js';
 
 async function triggerLLM() {
     const systemPrompt = buildSystemPrompt();
@@ -17,6 +18,8 @@ async function triggerLLM() {
         { role: 'system', content: systemPrompt },
         ...state.history
     ];
+
+    logDebug('system', 'Triggering LLM with conversation state', { historyLength: state.history.length, provider: state.provider });
 
     process.stdout.write(pc.gray('│\n') + pc.magenta('◆  ') + pc.green('BlanketClaw\n') + pc.gray('│  '));
 
@@ -81,20 +84,15 @@ async function triggerLLM() {
                 }
                 cleanToken = cleanToken.replace(/<\/think>/g, '');
             }
-
-            if (inThinking && !contentToken.includes('<think>') && contentToken.trim() !== '') {
-                inThinking = false;
-                if (state.thinkMode === 'show') {
-                    process.stdout.write(pc.dim('\n') + pc.gray('│  ') + pc.dim('└─ [Done]\n') + pc.gray('│  '));
-                }
-            }
             
             fullResponse += contentToken;
             
-            if (cleanToken && inThinking) {
-                 printThink(cleanToken);
-            } else if (cleanToken) {
-                 printNormal(cleanToken);
+            if (cleanToken) {
+                if (inThinking) {
+                     printThink(cleanToken);
+                } else {
+                     printNormal(cleanToken);
+                }
             }
         }
     };
@@ -110,10 +108,12 @@ async function triggerLLM() {
             }
             toolCalls = await streamOpenRouter(apiMessages, onChunkCallback);
         } else {
+            logDebug('error', `Unknown provider '${state.provider}'`);
             process.stdout.write(pc.red(`\n│  Error: Unknown provider '${state.provider}'`));
             return;
         }
     } catch (error) {
+        logDebug('fatal_error', 'triggerLLM Stream Failure', { message: error.message, stack: error.stack });
         process.stdout.write(pc.red(`\n│  Error: ${error.message}`));
         process.stdout.write('\n' + pc.gray('│\n'));
         return;
@@ -137,18 +137,20 @@ async function triggerLLM() {
     if (fullResponse.trim() !== "" || fullThinking.length > 0 || (toolCalls && toolCalls.length > 0)) {
         process.stdout.write('\n' + pc.gray('│\n'));
         
-        if (fullThinking.length > 0) {
-            fullResponse = `<think>\n${fullThinking}\n</think>\n${fullResponse}`;
-        }
+        // Strip reasoning tags out of the context history entirely to prevent model hallucination
+        let cleanHistoryContent = fullResponse.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim();
         
-        const assistantMessage = { role: 'assistant', content: fullResponse };
+        const assistantMessage = { role: 'assistant', content: cleanHistoryContent };
         
         if (toolCalls && toolCalls.length > 0) {
             assistantMessage.tool_calls = toolCalls;
         }
         
-        state.history.push(assistantMessage);
+        if (cleanHistoryContent !== "" || (toolCalls && toolCalls.length > 0)) {
+            state.history.push(assistantMessage);
+        }
     } else {
+        logDebug('warn', 'LLM returned completely empty response and no tools.');
         process.stdout.write('\n');
     }
 
@@ -156,7 +158,6 @@ async function triggerLLM() {
         for (const tc of toolCalls) {
             const toolResult = await executeTool(tc);
             
-            // --- FIX: Strictly adhere to 'role', 'content', and 'tool_call_id' ---
             state.history.push({ 
                 role: 'tool', 
                 content: toolResult,
@@ -177,7 +178,7 @@ async function mainLoop() {
                 input: process.stdin,
                 output: process.stdout,
                 completer: (line) => {
-                    const commands = ['/help', '/model', '/quit', '/clear', '/clear all', '/load', '/load all', '/status', '/think', '/verbose', '/persona', '/persona off', '/memory', '/log'];
+                    const commands = ['/help', '/model', '/quit', '/clear', '/clear all', '/load', '/load all', '/status', '/think', '/verbose', '/persona', '/persona off', '/memory', '/log', '/debug'];
                     
                     if (line.startsWith('/load ')) {
                         const search = line.replace('/load ', '');
@@ -230,6 +231,7 @@ async function mainLoop() {
             continue;
         }
 
+        logDebug('user_input', input);
         state.history.push({ role: 'user', content: input });
         await triggerLLM();
     }
