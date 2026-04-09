@@ -12,7 +12,7 @@ import { executeTool } from './lib/tools.js';
 import { handleCommand } from './lib/commands.js';
 import { logDebug } from './lib/logger.js';
 
-async function triggerLLM() {
+async function triggerLLM(retryCount = 0) {
     const systemPrompt = buildSystemPrompt();
     const apiMessages = [
         { role: 'system', content: systemPrompt },
@@ -28,13 +28,41 @@ async function triggerLLM() {
     let toolCalls = [];
     
     let inThinking = false;
+    let hasNativeThinking = false;
+
+    let inCodeBlock = false; // Tracks markdown state across streaming chunks
 
     function printNormal(text) {
-        const parts = text.split('\n');
+        // Split the incoming chunk by triple backticks to toggle the state
+        const parts = text.split('```');
+        
         for (let i = 0; i < parts.length; i++) {
-            process.stdout.write(parts[i]);
-            if (i < parts.length - 1) {
-                process.stdout.write('\n' + pc.gray('│  '));
+            // Flip the code block state every time we cross a ``` boundary
+            if (i > 0) inCodeBlock = !inCodeBlock;
+            
+            const chunk = parts[i];
+            
+            // Split by newline so we can maintain the left-hand border design
+            const lines = chunk.split('\n');
+            for (let j = 0; j < lines.length; j++) {
+                let lineText = lines[j];
+                
+                if (inCodeBlock) {
+                    // Inside a code block: Color everything cyan so it pops
+                    lineText = pc.cyan(lineText);
+                } else {
+                    // Outside a code block: Attempt basic inline markdown parsing
+                    // (Note: Regex works best here if the token isn't heavily fragmented by the stream)
+                    lineText = lineText.replace(/\*\*(.*?)\*\*/g, pc.bold(pc.white('$1')));
+                    lineText = lineText.replace(/`([^`]+)`/g, pc.yellow('$1')); // Inline code
+                }
+
+                process.stdout.write(lineText);
+                
+                // Print the border prefix for the next line
+                if (j < lines.length - 1) {
+                    process.stdout.write('\n' + pc.gray('│  '));
+                }
             }
         }
     }
@@ -51,19 +79,27 @@ async function triggerLLM() {
     }
 
     const onChunkCallback = (contentToken, thinkingToken) => {
-        if (thinkingToken && !inThinking) {
-            inThinking = true;
-            if (state.thinkMode === 'show') {
-                process.stdout.write(pc.dim('\n') + pc.gray('│  ') + pc.dim('┌─ [Thinking]\n') + pc.gray('│  ') + pc.dim('│  '));
-            }
-        }
-
         if (thinkingToken) {
+            hasNativeThinking = true;
+            if (!inThinking) {
+                inThinking = true;
+                if (state.thinkMode === 'show') {
+                    process.stdout.write(pc.dim('\n') + pc.gray('│  ') + pc.dim('┌─ [Thinking]\n') + pc.gray('│  ') + pc.dim('│  '));
+                }
+            }
             fullThinking += thinkingToken;
             printThink(thinkingToken);
         } 
-        else if (contentToken) {
+        
+        if (contentToken) {
             let cleanToken = contentToken;
+
+            if (hasNativeThinking && inThinking) {
+                inThinking = false;
+                if (state.thinkMode === 'show') {
+                    process.stdout.write(pc.dim('\n') + pc.gray('│  ') + pc.dim('└─ [Done]\n') + pc.gray('│  '));
+                }
+            }
             
             if (cleanToken.includes('<think>')) {
                 if (!inThinking) {
@@ -134,10 +170,9 @@ async function triggerLLM() {
         }
     }
 
-    if (fullResponse.trim() !== "" || fullThinking.length > 0 || (toolCalls && toolCalls.length > 0)) {
+    if (fullResponse.trim() !== "" || (toolCalls && toolCalls.length > 0)) {
         process.stdout.write('\n' + pc.gray('│\n'));
         
-        // Strip reasoning tags out of the context history entirely to prevent model hallucination
         let cleanHistoryContent = fullResponse.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim();
         
         const assistantMessage = { role: 'assistant', content: cleanHistoryContent };
@@ -150,8 +185,24 @@ async function triggerLLM() {
             state.history.push(assistantMessage);
         }
     } else {
-        logDebug('warn', 'LLM returned completely empty response and no tools.');
-        process.stdout.write('\n');
+        logDebug('warn', 'LLM returned empty response and no tools.');
+        process.stdout.write(pc.yellow(`\n│  [System: Ollama dropped the tool call due to invalid JSON syntax.]\n`));
+        
+        if (retryCount < 3) {
+            process.stdout.write(pc.cyan(`│  [Auto-Retry ${retryCount + 1}/3]: Forcing the AI to fix its formatting...\n`));
+            process.stdout.write(pc.gray('│\n'));
+            
+            state.history.push({
+                role: 'user',
+                content: "SYSTEM WARNING: Your tool call was dropped due to invalid JSON. If writing a file, DO NOT pass code in the JSON arguments. Write the code in a standard markdown block in your text response, then call write_file with ONLY the path."
+            });
+            
+            await triggerLLM(retryCount + 1);
+            return;
+        } else {
+            process.stdout.write(pc.red(`│  [System]: AI failed to format JSON after 3 attempts. Aborting.\n`));
+            process.stdout.write(pc.gray('│\n'));
+        }
     }
 
     if (toolCalls && toolCalls.length > 0) {
@@ -160,12 +211,13 @@ async function triggerLLM() {
             
             state.history.push({ 
                 role: 'tool', 
-                content: toolResult,
+                name: tc.function.name,
+                content: String(toolResult),
                 tool_call_id: tc.id 
             });
         }
 
-        await triggerLLM();
+        await triggerLLM(0);
     }
 }
 
