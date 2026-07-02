@@ -30,8 +30,6 @@ async function triggerLLM(retryCount = 0) {
     let toolCalls = [];
     
     let inThinking = false;
-    let hasNativeThinking = false;
-
     let inCodeBlock = false; 
 
     function printNormal(text) {
@@ -75,7 +73,6 @@ async function triggerLLM(retryCount = 0) {
 
     const onChunkCallback = (contentToken, thinkingToken) => {
         if (thinkingToken) {
-            hasNativeThinking = true;
             if (!inThinking) {
                 inThinking = true;
                 if (state.thinkMode === 'show') {
@@ -87,44 +84,15 @@ async function triggerLLM(retryCount = 0) {
         } 
         
         if (contentToken) {
-            let cleanToken = contentToken;
-
-            if (hasNativeThinking && inThinking) {
+            if (inThinking) {
                 inThinking = false;
                 if (state.thinkMode === 'show') {
                     process.stdout.write(pc.dim('\n') + pc.gray('│  ') + pc.dim('└─ [Done]\n') + pc.gray('│  '));
                 }
             }
             
-            if (cleanToken.includes('<think>')) {
-                if (!inThinking) {
-                    inThinking = true;
-                    if (state.thinkMode === 'show') {
-                        process.stdout.write(pc.dim('\n') + pc.gray('│  ') + pc.dim('┌─ [Thinking]\n') + pc.gray('│  ') + pc.dim('│  '));
-                    }
-                }
-                cleanToken = cleanToken.replace(/<think>/g, '');
-            }
-
-            if (cleanToken.includes('</think>')) {
-                if (inThinking) {
-                    inThinking = false;
-                    if (state.thinkMode === 'show') {
-                        process.stdout.write(pc.dim('\n') + pc.gray('│  ') + pc.dim('└─ [Done]\n') + pc.gray('│  '));
-                    }
-                }
-                cleanToken = cleanToken.replace(/<\/think>/g, '');
-            }
-            
             fullResponse += contentToken;
-            
-            if (cleanToken) {
-                if (inThinking) {
-                     printThink(cleanToken);
-                } else {
-                     printNormal(cleanToken);
-                }
-            }
+            printNormal(contentToken);
         }
     };
 
@@ -165,49 +133,17 @@ async function triggerLLM(retryCount = 0) {
         }
     }
 
-    let codeBlocks = [];
-    const codeBlockRegex = /```(\w*)\r?\n([\s\S]*?)```/g;
-    let match;
-    let blockIndex = 1;
-    while ((match = codeBlockRegex.exec(fullResponse)) !== null) {
-        let ext = match[1].trim() || "txt";
-        if (ext.length > 10) ext = "txt";
-        const code = match[2].trim();
-        const cachePath = path.join(CACHE_DIR, `cached_code_${blockIndex}.${ext}`);
-        fs.writeFileSync(cachePath, code, 'utf-8');
-        codeBlocks.push(cachePath.replace(/\\/g, '/'));
-        blockIndex++;
-    }
-
     if (fullResponse.trim() !== "" || (toolCalls && toolCalls.length > 0)) {
         process.stdout.write('\n' + pc.gray('│\n'));
         
-        let cleanHistoryContent = fullResponse.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim();
-        
-        const assistantMessage = { role: 'assistant', content: cleanHistoryContent };
+        const assistantMessage = { role: 'assistant', content: fullResponse.trim() };
         
         if (toolCalls && toolCalls.length > 0) {
             assistantMessage.tool_calls = toolCalls;
         }
         
-        if (cleanHistoryContent !== "" || (toolCalls && toolCalls.length > 0)) {
+        if (assistantMessage.content !== "" || (toolCalls && toolCalls.length > 0)) {
             state.history.push(assistantMessage);
-        }
-
-        if (codeBlocks.length > 0 && (!toolCalls || toolCalls.length === 0)) {
-            if (retryCount === 0) {
-                process.stdout.write(pc.yellow(`│  [System: Code block(s) detected with no tool calls. Safely cached.]\n`));
-                process.stdout.write(pc.cyan(`│  [Auto-Prompt]: Asking AI if it wants to save the cached code...\n`));
-                process.stdout.write(pc.gray('│\n'));
-
-                state.history.push({
-                    role: 'user',
-                    content: `SYSTEM: You generated code block(s) but did not call any tools to save them. Are you sure the code isn't supposed to be saved?\n\nIf you intended to save it, I have automatically cached your code block(s) here:\n${codeBlocks.map(p => `- ${p}`).join('\n')}\n\nYou can now use the \`move_file\` tool to move the cached file(s) into their actual intended directory (e.g., source: "${codeBlocks[0]}", destination: "actual/path/to/file"). If it was just for explanation and no saving is needed, just say so.`
-                });
-
-                await triggerLLM(retryCount + 1);
-                return;
-            }
         }
 
     } else {
@@ -250,30 +186,44 @@ async function triggerLLM(retryCount = 0) {
 async function mainLoop() {
     while (true) {
         const input = await new Promise((resolve) => {
-            let lineReceived = false;
+            let lines = [];
+            let pasteTimeout;
+            let isResolved = false;
+            
+            // Force stdin to wake up. Prevents terminal freezing after inactivity.
+            process.stdin.resume();
             
             const rl = readline.createInterface({
                 input: process.stdin,
                 output: process.stdout,
-                completer: (line) => {
+                
+                // Using an async completer (2 parameters) prevents disk I/O from 
+                // blocking the main thread, fixing the backspace/typing lag.
+                completer: (line, callback) => {
                     const commands = ['/help', '/model', '/quit', '/clear', '/clear all', '/load', '/load all', '/status', '/think', '/verbose', '/persona', '/persona off', '/memory', '/log', '/debug'];
                     
                     if (line.startsWith('/load ')) {
                         const search = line.replace('/load ', '');
-                        try {
-                            const files = fg.sync(search ? `${search}*` : '*', { dot: true, onlyFiles: false, deep: 1 });
-                            const hits = files.map(f => `/load ${f}`);
-                            return [hits.length ? hits : [], line];
-                        } catch (e) {
-                            return [[], line];
-                        }
+                        
+                        // Async file system call
+                        fg(search ? `${search}*` : '*', { dot: true, onlyFiles: false, deep: 1 })
+                            .then(files => {
+                                const hits = files.map(f => `/load ${f}`);
+                                callback(null, [hits.length ? hits : [], line]);
+                            })
+                            .catch(() => {
+                                callback(null, [[], line]);
+                            });
+                        return;
                     }
                     
                     if (line.startsWith('/')) {
                         const hits = commands.filter((c) => c.startsWith(line));
-                        return [hits.length ? hits : [], line];
+                        callback(null, [hits.length ? hits : [], line]);
+                        return;
                     }
-                    return [[], line];
+                    
+                    callback(null, [[], line]);
                 }
             });
 
@@ -282,9 +232,34 @@ async function mainLoop() {
             rl.prompt();
 
             rl.on('line', (line) => {
-                lineReceived = true;
-                rl.close();
-                resolve(line.trim());
+                if (isResolved) return;
+
+                lines.push(line);
+                
+                if (pasteTimeout) clearTimeout(pasteTimeout);
+
+                // Bumped to 50ms to comfortably handle chunky pastes over SSH/slow terminals
+                pasteTimeout = setTimeout(() => {
+                    const currentText = lines.join('\n');
+                    
+                    const codeBlocks = (currentText.match(/```/g) || []).length;
+                    const hasUnclosedBlock = codeBlocks % 2 !== 0;
+                    const lastLineEndsWithSlash = lines[lines.length - 1].trim().endsWith('\\');
+
+                    if (hasUnclosedBlock || lastLineEndsWithSlash) {
+                        rl.setPrompt(pc.gray('│  ... '));
+                        rl.prompt();
+                    } else {
+                        isResolved = true;
+                        rl.close();
+                        
+                        let finalInput = currentText.trim();
+                        if (finalInput.endsWith('\\')) {
+                            finalInput = finalInput.slice(0, -1).trim();
+                        }
+                        resolve(finalInput);
+                    }
+                }, 50);
             });
 
             rl.on('SIGINT', () => {
@@ -294,7 +269,7 @@ async function mainLoop() {
             });
 
             rl.on('close', () => {
-                if (!lineReceived) {
+                if (!isResolved) {
                     p.outro(pc.green('Goodbye!'));
                     process.exit(0);
                 }
