@@ -59,7 +59,8 @@ BlanketClaw uses a standard REPL interface. Standard text is sent to the LLM, wh
 ### **Context & Files**
 * `/load <file>` — Load a specific file into the AI's context window.
 * `/load src/*.js` — Use wildcards to load multiple files at once.
-* `/load all` — Load all readable files in the current working directory.
+* `/load all` — Load all readable files in the current working directory (top-level only).
+* `/load all **` — As above, but recursive through subdirectories.
 * `/clear` — Wipe the conversation history.
 * `/clear all` — Wipe the conversation history AND unload all context files.
 
